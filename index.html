@@ -372,7 +372,7 @@ const map = L.map('map', {
 document.getElementById('map').classList.add('dark-tiles');
 
 const { lonMin, lonMax, latMin, latMax } = GRID_BOUNDS;
-const sigmaKm = 28; // Gaussian IDW smoothing radius
+const sigmaKm = 45; // Gaussian IDW smoothing radius (widened to avoid patchy blob artifacts)
 
 // ============================================================
 // 2) Interpolation grid — a flat raster of snow depth (cm), covering
@@ -406,8 +406,8 @@ const isLand = new Uint8Array(GRID_NX * GRID_NY);
 // K closest stations with a tight Gaussian instead keeps that boundary
 // continuous — it blends smoothly between whichever stations are close,
 // rather than jumping from one to the other.
-const sigmaCoreKm = 10;
-const CORE_K = 6;
+const sigmaCoreKm = 16;
+const CORE_K = 10;
 const coreIdx = new Int16Array(GRID_NX * GRID_NY * CORE_K).fill(-1);
 const coreWeight = new Float32Array(GRID_NX * GRID_NY * CORE_K);
 const nearestDistKm = new Float32Array(GRID_NX * GRID_NY);
@@ -518,7 +518,7 @@ const snowCtx = snowCanvas.getContext('2d');
 // Within CORE_KM of a station, the narrow-sigma "core" field dominates;
 // beyond FADE_KM, the plain broad-sigma interpolation is used; in between,
 // the two are blended.
-const CORE_KM = 6, FADE_KM = 25;
+const CORE_KM = 10, FADE_KM = 40;
 
 function updateCanvas(idx) {
   const day = series[idx];
@@ -769,6 +769,13 @@ snowLayer = L.imageOverlay(snowCanvas.toDataURL(), [[latMax, lonMin], [latMin, l
   opacity: 1,
   interactive: false
 }).addTo(map);
+{
+  const imgEl = snowLayer.getElement();
+  if (imgEl) {
+    imgEl.style.filter = 'blur(2.5px)';
+    imgEl.style.imageRendering = 'auto'; // let the browser smooth-scale the low-res grid too
+  }
+}
 updateCanvas(curIndex);
 }
 main();
