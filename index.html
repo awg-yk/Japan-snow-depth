@@ -380,31 +380,36 @@ const { lonMin, lonMax, latMin, latMax } = GRID_BOUNDS;
 //    flat on the basemap. Region switching never touches this.
 //
 //    The Gaussian influence radius (sigma) is NOT one fixed number for
-//    every station. A station reporting deep snow (e.g. Mt. Fuji at
-//    300cm) usually means an isolated peak, so it should only affect a
-//    tight area around itself — otherwise the interpolation drags its
-//    huge value across low-snow neighbors far away. A station reporting
-//    shallow/no snow is usually sitting inside a broad, gently-varying
-//    field (or genuinely snow-free), so it can influence a wider area
-//    without looking wrong. So sigma is chosen per station, per day,
-//    from that station's OWN value that day:
-//      > 100cm  -> sigma 18km (tight, isolated-peak behavior)
-//      > 30cm   -> sigma 35km
-//      else     -> sigma 45km (broad, smooth low-snow field)
-//    Because this depends on the day's data, the weights can't be
-//    reduced to one static array the way a fixed sigma could. Instead,
-//    for every (grid cell, station) pair we precompute all 3 tiers'
-//    weights up front (a one-time cost, since distances never change),
-//    and at render time just pick whichever tier that station falls
-//    into that day — no exp() calls left at frame time, only lookups.
+//    every station — it depends on how ISOLATED that station currently
+//    is, not on its own snow depth. A deep-snow reading at an isolated
+//    peak (e.g. Mt. Fuji, with no other snowy station nearby) should
+//    only affect a tight area around itself; a deep-snow reading in a
+//    snowy region (e.g. Hokkaido, surrounded by other snowy stations)
+//    should blend smoothly into its neighbors like before. (Tying sigma
+//    to the station's own value instead of its isolation was the
+//    earlier, less accurate version of this idea — Mt. Fuji-scale peaks
+//    were still bleeding into the Kanto plain because a lone high value
+//    doesn't by itself say anything about what's *around* it.)
+//
+//    Isolation is measured per station, per day: count how many OTHER
+//    stations within 30km currently report >=30cm. Few such neighbors
+//    -> isolated peak -> tight sigma. Many -> part of a snowy region
+//    -> broad sigma, same as the old fixed-sigma behavior.
+//      0-1 nearby snowy neighbors -> sigma 18km (isolated peak)
+//      2-5                        -> sigma 30km
+//      6+                         -> sigma 45km (broad, regional snowpack)
+//    The 30km neighbor lookup itself is pure geometry (never changes),
+//    so it's precomputed once. Only the day-dependent neighbor COUNT is
+//    recomputed each frame, which is cheap (a handful of comparisons per
+//    station). The expensive part — per (grid cell, station) Gaussian
+//    weights for all 3 possible sigmas — is still fully precomputed up
+//    front exactly as before, so render time stays just lookups + sums,
+//    no exp() calls, no real change in per-frame cost.
 // ============================================================
 const GRID_NX = 260, GRID_NY = 230;
-const SIGMA_TIERS = [18, 35, 45]; // km, indexed by tier 0/1/2
-function tierFor(cm) {
-  if (cm > 100) return 0;
-  if (cm > 30) return 1;
-  return 2;
-}
+const SIGMA_TIERS = [18, 30, 45]; // km, indexed by isolation tier 0/1/2
+const ISO_RADIUS_KM = 30;
+const ISO_SNOW_CM = 30;
 
 const gridLon = new Float64Array(GRID_NX);
 const gridLat = new Float64Array(GRID_NY);
@@ -418,15 +423,48 @@ for (let i = 0; i < GRID_NX; i++) gridLon[i] = lonMin + (i / (GRID_NX - 1)) * (l
   }
 }
 
+const latRefRad = ((latMin + latMax) / 2) * Math.PI / 180;
+const kmPerDegLat = 110.57;
+const kmPerDegLon = 111.32 * Math.cos(latRefRad);
+
+function stationDistKm(a, b) {
+  const dLat = (a.lat - b.lat) * kmPerDegLat;
+  const dLon = (a.lon - b.lon) * kmPerDegLon;
+  return Math.sqrt(dLat * dLat + dLon * dLon);
+}
+
+// Static (data-independent) geometry: which other stations sit within
+// ISO_RADIUS_KM of each station. O(N^2) once at startup — trivial for
+// N ~ 400.
+const neighborLists = allStations.map((st, i) => {
+  const list = [];
+  for (let j = 0; j < N; j++) {
+    if (j === i) continue;
+    if (stationDistKm(st, allStations[j]) <= ISO_RADIUS_KM) list.push(j);
+  }
+  return new Int16Array(list);
+});
+
+// Recomputed once per rendered day (cheap: ~N * a handful of neighbors),
+// not per grid cell. tierFor(s) below reads this.
+const stationTier = new Uint8Array(N);
+function updateStationTiers(vals) {
+  for (let s = 0; s < N; s++) {
+    const neighbors = neighborLists[s];
+    let count = 0;
+    for (let k = 0; k < neighbors.length; k++) {
+      if (vals[neighbors[k]] >= ISO_SNOW_CM) count++;
+    }
+    stationTier[s] = count <= 1 ? 0 : (count <= 5 ? 1 : 2);
+  }
+}
+
 const isLand = new Uint8Array(GRID_NX * GRID_NY);
 // tierWeights[((gridIdx * N) + s) * 3 + tier] = un-normalized Gaussian
 // weight of station s at that grid cell, for each of the 3 sigma tiers.
 const tierWeights = new Float32Array(GRID_NX * GRID_NY * N * 3);
 
 {
-  const latRefRad = ((latMin + latMax) / 2) * Math.PI / 180;
-  const kmPerDegLat = 110.57;
-  const kmPerDegLon = 111.32 * Math.cos(latRefRad);
   const invTwoSigma2 = SIGMA_TIERS.map(sg => 1 / (2 * sg * sg));
   for (let j = 0; j < GRID_NY; j++) {
     const glat = gridLat[j];
@@ -449,16 +487,16 @@ const tierWeights = new Float32Array(GRID_NX * GRID_NY * N * 3);
   }
 }
 
-// Picks, for each station, the weight from whichever sigma tier its
-// CURRENT value falls into, then returns the normalized weighted average
-// for this grid cell. No exp() calls here — those were all done above.
+// Picks, for each station, the weight from whichever isolation tier it's
+// in TODAY (see updateStationTiers, called once per rendered day — not
+// per grid cell), then returns the normalized weighted average for this
+// grid cell. No exp() calls here — those were all done above.
 function interpolateSnowCm(gridIdx, vals) {
   const base = gridIdx * N * 3;
   let sumWV = 0, sumW = 0;
   for (let s = 0; s < N; s++) {
     const v = vals[s];
-    const tier = tierFor(v);
-    const w = tierWeights[base + s * 3 + tier];
+    const w = tierWeights[base + s * 3 + stationTier[s]];
     sumWV += w * v;
     sumW += w;
   }
@@ -513,6 +551,7 @@ function updateCanvas(idx) {
   const day = series[idx];
   const vals = new Float32Array(N);
   for (let s = 0; s < N; s++) vals[s] = day[s] || 0;
+  updateStationTiers(vals);
 
   const imgData = snowCtx.createImageData(GRID_NX, GRID_NY);
   const data = imgData.data;
