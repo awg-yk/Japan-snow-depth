@@ -372,15 +372,39 @@ const map = L.map('map', {
 document.getElementById('map').classList.add('dark-tiles');
 
 const { lonMin, lonMax, latMin, latMax } = GRID_BOUNDS;
-const sigmaKm = 45; // Gaussian IDW smoothing radius (widened to avoid patchy blob artifacts)
 
 // ============================================================
 // 2) Interpolation grid — a flat raster of snow depth (cm), covering
 //    the whole country, computed once (station positions + the fixed
 //    GRID_BOUNDS never change), later painted onto a canvas and draped
 //    flat on the basemap. Region switching never touches this.
+//
+//    The Gaussian influence radius (sigma) is NOT one fixed number for
+//    every station. A station reporting deep snow (e.g. Mt. Fuji at
+//    300cm) usually means an isolated peak, so it should only affect a
+//    tight area around itself — otherwise the interpolation drags its
+//    huge value across low-snow neighbors far away. A station reporting
+//    shallow/no snow is usually sitting inside a broad, gently-varying
+//    field (or genuinely snow-free), so it can influence a wider area
+//    without looking wrong. So sigma is chosen per station, per day,
+//    from that station's OWN value that day:
+//      > 100cm  -> sigma 18km (tight, isolated-peak behavior)
+//      > 30cm   -> sigma 35km
+//      else     -> sigma 45km (broad, smooth low-snow field)
+//    Because this depends on the day's data, the weights can't be
+//    reduced to one static array the way a fixed sigma could. Instead,
+//    for every (grid cell, station) pair we precompute all 3 tiers'
+//    weights up front (a one-time cost, since distances never change),
+//    and at render time just pick whichever tier that station falls
+//    into that day — no exp() calls left at frame time, only lookups.
 // ============================================================
-const GRID_NX = 340, GRID_NY = 300;
+const GRID_NX = 260, GRID_NY = 230;
+const SIGMA_TIERS = [18, 35, 45]; // km, indexed by tier 0/1/2
+function tierFor(cm) {
+  if (cm > 100) return 0;
+  if (cm > 30) return 1;
+  return 2;
+}
 
 const gridLon = new Float64Array(GRID_NX);
 const gridLat = new Float64Array(GRID_NY);
@@ -394,30 +418,16 @@ for (let i = 0; i < GRID_NX; i++) gridLon[i] = lonMin + (i / (GRID_NX - 1)) * (l
   }
 }
 
-const gridWeights = new Float32Array(GRID_NX * GRID_NY * N);
 const isLand = new Uint8Array(GRID_NX * GRID_NY);
-
-// "Core" field: a second, much narrower-sigma Gaussian interpolation used
-// only very close to stations, so an isolated peak (e.g. Mt. Fuji) keeps
-// its true value instead of being pulled down by the broad-sigma field's
-// distant zero-snow neighbors. Earlier this snapped to the single nearest
-// station's raw value, which produced hard seams (a mottled look) at the
-// boundary between two nearby stations' "nearest" zones. Summing over the
-// K closest stations with a tight Gaussian instead keeps that boundary
-// continuous — it blends smoothly between whichever stations are close,
-// rather than jumping from one to the other.
-const sigmaCoreKm = 16;
-const CORE_K = 10;
-const coreIdx = new Int16Array(GRID_NX * GRID_NY * CORE_K).fill(-1);
-const coreWeight = new Float32Array(GRID_NX * GRID_NY * CORE_K);
-const nearestDistKm = new Float32Array(GRID_NX * GRID_NY);
+// tierWeights[((gridIdx * N) + s) * 3 + tier] = un-normalized Gaussian
+// weight of station s at that grid cell, for each of the 3 sigma tiers.
+const tierWeights = new Float32Array(GRID_NX * GRID_NY * N * 3);
 
 {
   const latRefRad = ((latMin + latMax) / 2) * Math.PI / 180;
   const kmPerDegLat = 110.57;
   const kmPerDegLon = 111.32 * Math.cos(latRefRad);
-  const topD2 = new Float64Array(CORE_K);
-  const topS = new Int16Array(CORE_K);
+  const invTwoSigma2 = SIGMA_TIERS.map(sg => 1 / (2 * sg * sg));
   for (let j = 0; j < GRID_NY; j++) {
     const glat = gridLat[j];
     for (let i = 0; i < GRID_NX; i++) {
@@ -425,50 +435,34 @@ const nearestDistKm = new Float32Array(GRID_NX * GRID_NY);
       const gridIdx = j * GRID_NX + i;
       isLand[gridIdx] = isPointOnLand(glon, glat) ? 1 : 0;
       if (!isLand[gridIdx]) continue;
-      const rowOffset = gridIdx * N;
-      let sum = 0;
-      topD2.fill(Infinity);
-      topS.fill(-1);
+      const base = gridIdx * N * 3;
       for (let s = 0; s < N; s++) {
         const dLat = (glat - allStations[s].lat) * kmPerDegLat;
         const dLon = (glon - allStations[s].lon) * kmPerDegLon;
         const d2 = dLat * dLat + dLon * dLon;
-        const w = Math.exp(-d2 / (2 * sigmaKm * sigmaKm));
-        gridWeights[rowOffset + s] = w;
-        sum += w;
-        // insertion into the small top-K-nearest list
-        if (d2 < topD2[CORE_K - 1]) {
-          let p = CORE_K - 1;
-          while (p > 0 && topD2[p - 1] > d2) { topD2[p] = topD2[p - 1]; topS[p] = topS[p - 1]; p--; }
-          topD2[p] = d2; topS[p] = s;
-        }
-      }
-      if (sum > 0) {
-        for (let s = 0; s < N; s++) gridWeights[rowOffset + s] /= sum;
-      }
-
-      nearestDistKm[gridIdx] = Math.sqrt(topD2[0]);
-      const coreBase = gridIdx * CORE_K;
-      let coreSum = 0;
-      for (let k = 0; k < CORE_K; k++) {
-        if (topS[k] < 0) continue;
-        const w = Math.exp(-topD2[k] / (2 * sigmaCoreKm * sigmaCoreKm));
-        coreIdx[coreBase + k] = topS[k];
-        coreWeight[coreBase + k] = w;
-        coreSum += w;
-      }
-      if (coreSum > 0) {
-        for (let k = 0; k < CORE_K; k++) coreWeight[coreBase + k] /= coreSum;
+        const off = base + s * 3;
+        tierWeights[off]     = Math.exp(-d2 * invTwoSigma2[0]);
+        tierWeights[off + 1] = Math.exp(-d2 * invTwoSigma2[1]);
+        tierWeights[off + 2] = Math.exp(-d2 * invTwoSigma2[2]);
       }
     }
   }
 }
 
+// Picks, for each station, the weight from whichever sigma tier its
+// CURRENT value falls into, then returns the normalized weighted average
+// for this grid cell. No exp() calls here — those were all done above.
 function interpolateSnowCm(gridIdx, vals) {
-  const rowOffset = gridIdx * N;
-  let cm = 0;
-  for (let s = 0; s < N; s++) cm += gridWeights[rowOffset + s] * vals[s];
-  return cm;
+  const base = gridIdx * N * 3;
+  let sumWV = 0, sumW = 0;
+  for (let s = 0; s < N; s++) {
+    const v = vals[s];
+    const tier = tierFor(v);
+    const w = tierWeights[base + s * 3 + tier];
+    sumWV += w * v;
+    sumW += w;
+  }
+  return sumW > 0 ? sumWV / sumW : 0;
 }
 
 // ============================================================
@@ -515,11 +509,6 @@ snowCanvas.style.top = '-99999px';
 document.body.appendChild(snowCanvas);
 const snowCtx = snowCanvas.getContext('2d');
 
-// Within CORE_KM of a station, the narrow-sigma "core" field dominates;
-// beyond FADE_KM, the plain broad-sigma interpolation is used; in between,
-// the two are blended.
-const CORE_KM = 10, FADE_KM = 40;
-
 function updateCanvas(idx) {
   const day = series[idx];
   const vals = new Float32Array(N);
@@ -531,20 +520,7 @@ function updateCanvas(idx) {
   for (let g = 0; g < total; g++) {
     const px = g * 4;
     if (!isLand[g]) { data[px + 3] = 0; continue; }
-    const broad = interpolateSnowCm(g, vals);
-    const coreBase = g * CORE_K;
-    let core = 0;
-    for (let k = 0; k < CORE_K; k++) {
-      const si = coreIdx[coreBase + k];
-      if (si < 0) continue;
-      core += coreWeight[coreBase + k] * vals[si];
-    }
-    const d = nearestDistKm[g];
-    let blend;
-    if (d <= CORE_KM) blend = 1;
-    else if (d >= FADE_KM) blend = 0;
-    else blend = 1 - (d - CORE_KM) / (FADE_KM - CORE_KM);
-    const cm = core * blend + broad * (1 - blend);
+    const cm = interpolateSnowCm(g, vals);
     const t = Math.min(Math.pow(cm / 100, 0.45), 1);
     const [r, gg, b, a] = colorForT(t);
     data[px] = r; data[px + 1] = gg; data[px + 2] = b; data[px + 3] = a;
