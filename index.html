@@ -396,12 +396,28 @@ for (let i = 0; i < GRID_NX; i++) gridLon[i] = lonMin + (i / (GRID_NX - 1)) * (l
 
 const gridWeights = new Float32Array(GRID_NX * GRID_NY * N);
 const isLand = new Uint8Array(GRID_NX * GRID_NY);
-const nearestStation = new Int16Array(GRID_NX * GRID_NY).fill(-1);
+
+// "Core" field: a second, much narrower-sigma Gaussian interpolation used
+// only very close to stations, so an isolated peak (e.g. Mt. Fuji) keeps
+// its true value instead of being pulled down by the broad-sigma field's
+// distant zero-snow neighbors. Earlier this snapped to the single nearest
+// station's raw value, which produced hard seams (a mottled look) at the
+// boundary between two nearby stations' "nearest" zones. Summing over the
+// K closest stations with a tight Gaussian instead keeps that boundary
+// continuous — it blends smoothly between whichever stations are close,
+// rather than jumping from one to the other.
+const sigmaCoreKm = 10;
+const CORE_K = 6;
+const coreIdx = new Int16Array(GRID_NX * GRID_NY * CORE_K).fill(-1);
+const coreWeight = new Float32Array(GRID_NX * GRID_NY * CORE_K);
 const nearestDistKm = new Float32Array(GRID_NX * GRID_NY);
+
 {
   const latRefRad = ((latMin + latMax) / 2) * Math.PI / 180;
   const kmPerDegLat = 110.57;
   const kmPerDegLon = 111.32 * Math.cos(latRefRad);
+  const topD2 = new Float64Array(CORE_K);
+  const topS = new Int16Array(CORE_K);
   for (let j = 0; j < GRID_NY; j++) {
     const glat = gridLat[j];
     for (let i = 0; i < GRID_NX; i++) {
@@ -411,7 +427,8 @@ const nearestDistKm = new Float32Array(GRID_NX * GRID_NY);
       if (!isLand[gridIdx]) continue;
       const rowOffset = gridIdx * N;
       let sum = 0;
-      let bestD2 = Infinity, bestS = -1;
+      topD2.fill(Infinity);
+      topS.fill(-1);
       for (let s = 0; s < N; s++) {
         const dLat = (glat - allStations[s].lat) * kmPerDegLat;
         const dLon = (glon - allStations[s].lon) * kmPerDegLon;
@@ -419,13 +436,30 @@ const nearestDistKm = new Float32Array(GRID_NX * GRID_NY);
         const w = Math.exp(-d2 / (2 * sigmaKm * sigmaKm));
         gridWeights[rowOffset + s] = w;
         sum += w;
-        if (d2 < bestD2) { bestD2 = d2; bestS = s; }
+        // insertion into the small top-K-nearest list
+        if (d2 < topD2[CORE_K - 1]) {
+          let p = CORE_K - 1;
+          while (p > 0 && topD2[p - 1] > d2) { topD2[p] = topD2[p - 1]; topS[p] = topS[p - 1]; p--; }
+          topD2[p] = d2; topS[p] = s;
+        }
       }
       if (sum > 0) {
         for (let s = 0; s < N; s++) gridWeights[rowOffset + s] /= sum;
       }
-      nearestStation[gridIdx] = bestS;
-      nearestDistKm[gridIdx] = Math.sqrt(bestD2);
+
+      nearestDistKm[gridIdx] = Math.sqrt(topD2[0]);
+      const coreBase = gridIdx * CORE_K;
+      let coreSum = 0;
+      for (let k = 0; k < CORE_K; k++) {
+        if (topS[k] < 0) continue;
+        const w = Math.exp(-topD2[k] / (2 * sigmaCoreKm * sigmaCoreKm));
+        coreIdx[coreBase + k] = topS[k];
+        coreWeight[coreBase + k] = w;
+        coreSum += w;
+      }
+      if (coreSum > 0) {
+        for (let k = 0; k < CORE_K; k++) coreWeight[coreBase + k] /= coreSum;
+      }
     }
   }
 }
@@ -481,13 +515,10 @@ snowCanvas.style.top = '-99999px';
 document.body.appendChild(snowCanvas);
 const snowCtx = snowCanvas.getContext('2d');
 
-// Within CORE_KM of a station, show its raw value almost as-is; beyond
-// FADE_KM, use the plain normalized interpolation; in between, blend the
-// two. Without this, an isolated high-snow peak (e.g. Mt. Fuji) with only
-// low/no-snow neighbors nearby gets averaged down well before its own
-// marker, because those neighbors' Gaussian weights are still large at
-// the peak's own location.
-const CORE_KM = 4, FADE_KM = 18;
+// Within CORE_KM of a station, the narrow-sigma "core" field dominates;
+// beyond FADE_KM, the plain broad-sigma interpolation is used; in between,
+// the two are blended.
+const CORE_KM = 6, FADE_KM = 25;
 
 function updateCanvas(idx) {
   const day = series[idx];
@@ -500,15 +531,20 @@ function updateCanvas(idx) {
   for (let g = 0; g < total; g++) {
     const px = g * 4;
     if (!isLand[g]) { data[px + 3] = 0; continue; }
-    const interp = interpolateSnowCm(g, vals);
-    const ns = nearestStation[g];
-    const raw = ns >= 0 ? vals[ns] : interp;
+    const broad = interpolateSnowCm(g, vals);
+    const coreBase = g * CORE_K;
+    let core = 0;
+    for (let k = 0; k < CORE_K; k++) {
+      const si = coreIdx[coreBase + k];
+      if (si < 0) continue;
+      core += coreWeight[coreBase + k] * vals[si];
+    }
     const d = nearestDistKm[g];
     let blend;
     if (d <= CORE_KM) blend = 1;
     else if (d >= FADE_KM) blend = 0;
     else blend = 1 - (d - CORE_KM) / (FADE_KM - CORE_KM);
-    const cm = raw * blend + interp * (1 - blend);
+    const cm = core * blend + broad * (1 - blend);
     const t = Math.min(Math.pow(cm / 100, 0.45), 1);
     const [r, gg, b, a] = colorForT(t);
     data[px] = r; data[px + 1] = gg; data[px + 2] = b; data[px + 3] = a;
