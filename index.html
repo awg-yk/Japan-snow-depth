@@ -244,13 +244,11 @@
 </div>
 <script type="module">
 // ==== DATA ====
-// stations.json / coastline.json now cover all of Japan (Hokkaido, Tohoku,
-// Eastern Japan, Western Japan combined) with each entry tagged with its
-// source region ("region" on stations, "g" on coastline polygons). Each
-// season's data/snow/<year>.json likewise holds every station nationwide,
-// in the same station order as stations.json, for every date. Region
-// selection is purely a client-side filter over this one shared dataset —
-// switching region never re-fetches snow data, only switching year does.
+// stations.json / coastline.json cover all of Japan (Hokkaido, Tohoku,
+// Eastern Japan, Western Japan combined). Every station and every land
+// polygon is always loaded and always rendered — the region selector only
+// moves the camera (map.fitBounds), it never filters what's drawn. This
+// keeps e.g. Tohoku's snow visible while the camera is framed on Hokkaido.
 const DATA_BASE = './data';
 
 async function fetchJSON(path) {
@@ -270,26 +268,32 @@ async function loadYearData(yearKey) {
 const YEAR_KEYS = ["1983", "1984", "1985", "1986", "1987", "1988", "1989", "1990", "1991", "1992", "1993", "1994", "1995", "1996", "1997", "1998", "1999", "2000", "2001", "2002", "2003", "2004", "2005", "2006", "2007", "2008", "2009", "2010", "2011", "2012", "2013", "2014", "2015", "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024", "2025"];
 const DEFAULT_YEAR = YEAR_KEYS[YEAR_KEYS.length - 1];
 
-const REGION_CONFIG = {
-  national: { label: '全国',   lonMin: 122.50, lonMax: 146.50, latMin: 24.00, latMax: 45.65, center: [34.8, 136.5], zoom: 5 },
-  hokkaido: { label: '北海道', lonMin: 139.30, lonMax: 145.95, latMin: 41.30, latMax: 45.62, center: [43.15, 142.9], zoom: 7 },
-  tohoku:   { label: '東北',   lonMin: 138.90, lonMax: 142.30, latMin: 36.60, latMax: 41.75, center: [39.2, 140.6], zoom: 7 },
-  eastern:  { label: '東日本', lonMin: 135.90, lonMax: 141.10, latMin: 34.40, latMax: 38.70, center: [36.5, 138.7], zoom: 7 },
-  western:  { label: '西日本', lonMin: 128.60, lonMax: 136.80, latMin: 28.20, latMax: 36.35, center: [32.5, 132.5], zoom: 7 }
+// GRID_BOUNDS: the one fixed extent the shared interpolation grid is built
+// over. Chosen to fully contain every region's camera view below (with
+// margin) so panning/focusing on any region never shows a blank edge.
+const GRID_BOUNDS = { lonMin: 122.50, lonMax: 146.50, latMin: 24.00, latMax: 45.65 };
+
+// VIEW_BOUNDS: camera framing only, used with map.fitBounds() when the
+// region selector changes. "national" is intentionally tighter than
+// GRID_BOUNDS (Soya Strait down to Yakushima) so the default view isn't
+// zoomed out as far as Sakhalin/Taiwan; the underlying grid still covers
+// the full country, so Okinawa etc. remain visible/paintable if you pan.
+const REGION_LABELS = { national: '全国', hokkaido: '北海道', tohoku: '東北', eastern: '東日本', western: '西日本' };
+const VIEW_BOUNDS = {
+  national: { lonMin: 128.30, lonMax: 146.20, latMin: 29.80, latMax: 45.70 },
+  hokkaido: { lonMin: 139.30, lonMax: 145.95, latMin: 41.30, latMax: 45.62 },
+  tohoku:   { lonMin: 138.90, lonMax: 142.30, latMin: 36.60, latMax: 41.75 },
+  eastern:  { lonMin: 135.90, lonMax: 141.10, latMin: 34.40, latMax: 38.70 },
+  western:  { lonMin: 128.60, lonMax: 136.80, latMin: 28.20, latMax: 36.35 }
 };
 const DEFAULT_REGION = 'national';
 
 let allStations = [];
 let allCoast = [];
-
-// Per-region working state, rebuilt every time the region selector changes.
-let stationIdx = [];      // indices into allStations for the current region
-let filteredStations = []; // allStations[stationIdx[s]] for s in [0,N)
 let N = 0;
-let lonMin, lonMax, latMin, latMax;
 
 let dates = [];
-let series = []; // full nationwide rows; always index via stationIdx
+let series = [];
 
 let startIndex = 0;
 let globalMax = 0;
@@ -297,12 +301,7 @@ let colorScaleMax = 1;
 
 function computeGlobalMax() {
   let m = 0;
-  for (const day of series) {
-    for (let s = 0; s < N; s++) {
-      const v = day[stationIdx[s]];
-      if (v !== null && v > m) m = v;
-    }
-  }
+  for (const day of series) for (const v of day) if (v !== null && v > m) m = v;
   return m;
 }
 
@@ -318,13 +317,12 @@ function pointInRing(lon, lat, ring) {
   return inside;
 }
 
-// A point counts as land if it falls inside ANY of the current region's
-// coastline polygons. Each polygon's bounding box is checked first so the
-// grid scan stays fast.
-let currentPolys = [];
+// A point counts as land if it falls inside ANY coastline polygon,
+// nationwide. Each polygon's bounding box is checked first so the grid
+// scan stays fast even with 800+ polygons.
 function isPointOnLand(lon, lat) {
-  for (let p = 0; p < currentPolys.length; p++) {
-    const poly = currentPolys[p];
+  for (let p = 0; p < allCoast.length; p++) {
+    const poly = allCoast[p];
     const b = poly.b;
     if (lon < b[0] || lon > b[2] || lat < b[1] || lat > b[3]) continue;
     if (pointInRing(lon, lat, poly.r)) return true;
@@ -332,18 +330,33 @@ function isPointOnLand(lon, lat) {
   return false;
 }
 
+// Web Mercator <-> latitude helpers. Leaflet's ImageOverlay places a raster
+// by linearly interpolating in *Mercator* space between the bounds' two
+// corners, not in raw degrees. A grid whose rows are spaced evenly in
+// degrees drifts further from its true position the taller the bounds
+// are — negligible for a ~5° regional box, but several tens of km over
+// the full country. Spacing rows evenly in Mercator-Y instead keeps every
+// row exactly where it belongs regardless of extent.
+function latToMercY(lat) {
+  const rad = lat * Math.PI / 180;
+  return Math.log(Math.tan(Math.PI / 4 + rad / 2));
+}
+function mercYToLat(y) {
+  return (2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180 / Math.PI;
+}
+
 async function main() {
   [allStations, allCoast] = await Promise.all([
     fetchJSON(`${DATA_BASE}/stations.json`),
     fetchJSON(`${DATA_BASE}/coastline.json`)
   ]);
+  N = allStations.length;
 
 // ============================================================
 // 1) Set up the flat map (no terrain / no 3D — pitch is locked to 0)
 // ============================================================
+const vb0 = VIEW_BOUNDS[DEFAULT_REGION];
 const map = L.map('map', {
-  center: REGION_CONFIG[DEFAULT_REGION].center,
-  zoom: REGION_CONFIG[DEFAULT_REGION].zoom,
   zoomControl: true,
   attributionControl: true,
   dragging: true,
@@ -351,31 +364,35 @@ const map = L.map('map', {
   touchZoom: true,
   doubleClickZoom: true,
   boxZoom: false
-});
+}).fitBounds([[vb0.latMin, vb0.lonMin], [vb0.latMax, vb0.lonMax]]);
 document.getElementById('map').classList.add('dark-tiles');
 
+const { lonMin, lonMax, latMin, latMax } = GRID_BOUNDS;
 const sigmaKm = 28; // Gaussian IDW smoothing radius
 
 // ============================================================
-// 2) Interpolation grid — a flat raster of snow depth (cm),
-//    later painted onto a canvas and draped as a map image.
-//    This grid (and its per-station weights) depends only on the
-//    current region's station positions + extent, so it is rebuilt
-//    only when the region selector changes — never on year switches.
+// 2) Interpolation grid — a flat raster of snow depth (cm), covering
+//    the whole country, computed once (station positions + the fixed
+//    GRID_BOUNDS never change), later painted onto a canvas and draped
+//    flat on the basemap. Region switching never touches this.
 // ============================================================
-const GRID_NX = 220, GRID_NY = 168;
+const GRID_NX = 340, GRID_NY = 300;
+
 const gridLon = new Float64Array(GRID_NX);
 const gridLat = new Float64Array(GRID_NY);
-let gridWeights = new Float32Array(0);
-let isLand = new Uint8Array(0);
+for (let i = 0; i < GRID_NX; i++) gridLon[i] = lonMin + (i / (GRID_NX - 1)) * (lonMax - lonMin);
+{
+  const yTop = latToMercY(latMax);
+  const yBot = latToMercY(latMin);
+  for (let j = 0; j < GRID_NY; j++) {
+    const y = yTop - (j / (GRID_NY - 1)) * (yTop - yBot);
+    gridLat[j] = mercYToLat(y);
+  }
+}
 
-function rebuildGrid() {
-  for (let i = 0; i < GRID_NX; i++) gridLon[i] = lonMin + (i / (GRID_NX - 1)) * (lonMax - lonMin);
-  for (let j = 0; j < GRID_NY; j++) gridLat[j] = latMax - (j / (GRID_NY - 1)) * (latMax - latMin);
-
-  gridWeights = new Float32Array(GRID_NX * GRID_NY * N);
-  isLand = new Uint8Array(GRID_NX * GRID_NY);
-
+const gridWeights = new Float32Array(GRID_NX * GRID_NY * N);
+const isLand = new Uint8Array(GRID_NX * GRID_NY);
+{
   const latRefRad = ((latMin + latMax) / 2) * Math.PI / 180;
   const kmPerDegLat = 110.57;
   const kmPerDegLon = 111.32 * Math.cos(latRefRad);
@@ -389,8 +406,8 @@ function rebuildGrid() {
       const rowOffset = gridIdx * N;
       let sum = 0;
       for (let s = 0; s < N; s++) {
-        const dLat = (glat - filteredStations[s].lat) * kmPerDegLat;
-        const dLon = (glon - filteredStations[s].lon) * kmPerDegLon;
+        const dLat = (glat - allStations[s].lat) * kmPerDegLat;
+        const dLon = (glon - allStations[s].lon) * kmPerDegLon;
         const d2 = dLat * dLat + dLon * dLon;
         const w = Math.exp(-d2 / (2 * sigmaKm * sigmaKm));
         gridWeights[rowOffset + s] = w;
@@ -412,10 +429,10 @@ function interpolateSnowCm(gridIdx, vals) {
 
 // ============================================================
 // 3) Canvas-painted snow overlay, draped flat on the basemap.
-//    Color scale is calibrated to the season's true maximum
-//    WITHIN THE CURRENT REGION; EXAG_FACTOR only stretches how
-//    strongly that scale is applied visually (a display-only
-//    gamma-style boost), it never changes the underlying cm values.
+//    Color scale is calibrated to the season's true nationwide maximum;
+//    EXAG_FACTOR only stretches how strongly that scale is applied
+//    visually (a display-only gamma-style boost), it never changes
+//    the underlying cm values. Fixed (not user-adjustable).
 // ============================================================
 const EXAG_FACTOR = 3.0;
 const COLOR_STOPS = [
@@ -457,7 +474,7 @@ const snowCtx = snowCanvas.getContext('2d');
 function updateCanvas(idx) {
   const day = series[idx];
   const vals = new Float32Array(N);
-  for (let s = 0; s < N; s++) vals[s] = day[stationIdx[s]] || 0;
+  for (let s = 0; s < N; s++) vals[s] = day[s] || 0;
 
   const exagg = EXAG_FACTOR;
   const imgData = snowCtx.createImageData(GRID_NX, GRID_NY);
@@ -477,7 +494,8 @@ function updateCanvas(idx) {
 }
 
 // ============================================================
-// 4) Station snow-depth labels (numbers only, no bars)
+// 4) Station snow-depth labels (numbers only, no bars) — every
+//    station nationwide, always. Region selection never touches these.
 // ============================================================
 const stationTooltip = document.getElementById('stationTooltip');
 
@@ -495,38 +513,34 @@ function hideStationTooltip() {
   stationTooltip.classList.remove('visible');
 }
 
-let labelObjs = [];
-function rebuildMarkers() {
-  for (const lbl of labelObjs) map.removeLayer(lbl.marker);
-  labelObjs = filteredStations.map(st => {
-    const marker = L.marker([st.lat, st.lon], {
-      icon: L.divIcon({
-        className: 'snow-label-wrap',
-        html: '<div class="snow-label"></div><div class="snow-label-dot"></div>',
-        iconSize: [0, 0],
-        iconAnchor: [0, 0]
-      }),
-      interactive: false
-    }).addTo(map);
-    const el = marker.getElement();
-    const valEl = el.querySelector('.snow-label');
+const labelObjs = allStations.map(st => {
+  const marker = L.marker([st.lat, st.lon], {
+    icon: L.divIcon({
+      className: 'snow-label-wrap',
+      html: '<div class="snow-label"></div><div class="snow-label-dot"></div>',
+      iconSize: [0, 0],
+      iconAnchor: [0, 0]
+    }),
+    interactive: false
+  }).addTo(map);
+  const el = marker.getElement();
+  const valEl = el.querySelector('.snow-label');
 
-    // Hovering a number shows only that station's name; moving to another
-    // number immediately swaps the tooltip content since there is just one
-    // shared tooltip element for the whole map.
-    valEl.addEventListener('mouseenter', (e) => {
-      showStationTooltip(st.name, e.clientX, e.clientY);
-    });
-    valEl.addEventListener('mousemove', (e) => {
-      moveStationTooltip(e.clientX, e.clientY);
-    });
-    valEl.addEventListener('mouseleave', () => {
-      hideStationTooltip();
-    });
-
-    return { el, valEl, marker };
+  // Hovering a number shows only that station's name; moving to another
+  // number immediately swaps the tooltip content since there is just one
+  // shared tooltip element for the whole map.
+  valEl.addEventListener('mouseenter', (e) => {
+    showStationTooltip(st.name, e.clientX, e.clientY);
   });
-}
+  valEl.addEventListener('mousemove', (e) => {
+    moveStationTooltip(e.clientX, e.clientY);
+  });
+  valEl.addEventListener('mouseleave', () => {
+    hideStationTooltip();
+  });
+
+  return { el, valEl, marker };
+});
 
 // ============================================================
 // 5) Playback controls
@@ -536,15 +550,14 @@ let playing = false;
 let timer = null;
 let endIndex = 0;
 
-// Finds the last day index that still has snow (>0) at any station IN THE
-// CURRENT REGION, then returns the following day (guaranteed all-zero) so
-// the right edge of the slider always lands on a fully-zero, stays-zero day.
+// Finds the last day index that still has snow (>0) anywhere in the
+// country, then returns the following day (guaranteed all-zero) so the
+// right edge of the slider always lands on a fully-zero, stays-zero day.
 function computeEndIndex() {
   for (let idx = series.length - 1; idx >= 0; idx--) {
     const day = series[idx];
     for (let s = 0; s < N; s++) {
-      const v = day[stationIdx[s]];
-      if (v !== null && v > 0) {
+      if (day[s] !== null && day[s] > 0) {
         return Math.min(idx + 1, series.length - 1);
       }
     }
@@ -577,12 +590,12 @@ function render(idx) {
 
   let dayMax = 0, dayMaxName = '';
   for (let s = 0; s < N; s++) {
-    const v = day[stationIdx[s]];
-    if (v !== null && v > dayMax) { dayMax = v; dayMaxName = filteredStations[s].name; }
+    const v = day[s];
+    if (v !== null && v > dayMax) { dayMax = v; dayMaxName = allStations[s].name; }
   }
 
   for (let s = 0; s < N; s++) {
-    const v = day[stationIdx[s]];
+    const v = day[s];
     const lbl = labelObjs[s];
     if (v === null || v <= 0) {
       lbl.el.style.opacity = '0';
@@ -617,87 +630,31 @@ function stopPlay() {
 playBtn.addEventListener('click', () => { playing ? stopPlay() : startPlay(); });
 speedSel.addEventListener('change', () => { if (playing) { stopPlay(); startPlay(); } });
 
-function updateTitleAndRange() {
-  const startY = parseInt(yearSel.value, 10);
-  const endY = startY + 1;
-  const label = REGION_CONFIG[currentRegion].label;
-  titleText.textContent = `${label} 日最深積雪 平面マップ`;
-  rangeLabel.textContent = `${startY}年10月1日〜${endY}年5月31日 ／ 気象庁アメダス・国土地理院 淡色地図`;
-  document.title = `${label} 日最深積雪 平面マップ ${startY}-${endY}`;
-}
-
-// Recomputes region-dependent stats (max value, season end) from the
-// already-loaded year data, then re-renders. Used both after a year switch
-// and after a region switch (year data doesn't change on region switch).
-function refreshFromLoadedYear() {
-  startIndex = Math.min(startIndex, dates.length - 1);
-  endIndex = Math.max(computeEndIndex(), startIndex);
-  globalMax = computeGlobalMax();
-  colorScaleMax = globalMax > 0 ? globalMax : 1;
-  legendMax.textContent = Math.round(globalMax) + 'cm';
-  slider.min = startIndex;
-  slider.max = endIndex;
-  const idx = Math.min(Math.max(curIndex, startIndex), endIndex);
-  render(idx);
-}
-
 // ============================================================
-// 6) Region switching — rebuilds the station subset, coastline
-//    mask, interpolation grid and markers for the newly selected
-//    region, then redraws using the currently loaded year's data.
+// 6) Region switching — camera only. The grid, mask, markers and
+//    color scale are nationwide and never change; only the map's
+//    framing (via fitBounds) moves.
 // ============================================================
 let currentRegion = DEFAULT_REGION;
-let snowLayer = null;
 
-async function switchRegion(regionKey) {
-  stopPlay();
-  document.getElementById('loading').style.display = 'flex';
-  document.getElementById('loading').style.opacity = 1;
-  // Let the loading indicator paint before the heavy synchronous grid rebuild
-  await new Promise(r => setTimeout(r, 20));
-
+function switchRegion(regionKey) {
   currentRegion = regionKey;
-  const cfg = REGION_CONFIG[regionKey];
-  lonMin = cfg.lonMin; lonMax = cfg.lonMax; latMin = cfg.latMin; latMax = cfg.latMax;
-
-  stationIdx = [];
-  for (let i = 0; i < allStations.length; i++) {
-    if (regionKey === 'national' || allStations[i].region === regionKey) stationIdx.push(i);
-  }
-  filteredStations = stationIdx.map(i => allStations[i]);
-  N = filteredStations.length;
-
-  currentPolys = allCoast.filter(p => regionKey === 'national' || p.g === regionKey);
-
-  rebuildGrid();
-  rebuildMarkers();
-
-  map.setView(cfg.center, cfg.zoom);
-
-  const bounds = [[latMax, lonMin], [latMin, lonMax]];
-  if (snowLayer) {
-    snowLayer.setBounds(bounds);
-  } else {
-    snowLayer = L.imageOverlay(snowCanvas.toDataURL(), bounds, {
-      opacity: 1,
-      interactive: false
-    }).addTo(map);
-  }
-
-  updateTitleAndRange();
-  if (series.length) refreshFromLoadedYear();
-
-  document.getElementById('loading').style.opacity = 0;
-  setTimeout(() => { document.getElementById('loading').style.display = 'none'; }, 450);
+  const vb = VIEW_BOUNDS[regionKey];
+  map.fitBounds([[vb.latMin, vb.lonMin], [vb.latMax, vb.lonMax]]);
+  const label = REGION_LABELS[regionKey];
+  titleText.textContent = `${label} 日最深積雪 平面マップ`;
+  const startY = parseInt(yearSel.value, 10);
+  document.title = `${label} 日最深積雪 平面マップ ${startY}-${startY + 1}`;
 }
 
 regionSel.addEventListener('change', () => { switchRegion(regionSel.value); });
 
 // ============================================================
 // 7) Year switching — loads a different season's dates/series;
-//    the grid, mask and markers stay as-is (only the region
-//    selector rebuilds those).
+//    the grid, mask and markers stay as-is.
 // ============================================================
+let snowLayer = null;
+
 async function loadYear(yearKey) {
   stopPlay();
   document.getElementById('loading').style.display = 'flex';
@@ -706,12 +663,24 @@ async function loadYear(yearKey) {
   if (!yd) return;
   dates = yd.dates;
   series = yd.series;
-  startIndex = yd.startIndex;
-  curIndex = startIndex;
+  startIndex = Math.min(yd.startIndex, dates.length - 1);
+  endIndex = Math.max(computeEndIndex(), startIndex);
 
-  updateTitleAndRange();
-  refreshFromLoadedYear();
+  globalMax = computeGlobalMax();
+  colorScaleMax = globalMax > 0 ? globalMax : 1;
+  legendMax.textContent = Math.round(globalMax) + 'cm';
 
+  const startY = parseInt(yearKey, 10);
+  const endY = startY + 1;
+  const label = REGION_LABELS[currentRegion];
+  rangeLabel.textContent = `${startY}年10月1日〜${endY}年5月31日 ／ 気象庁アメダス・国土地理院 淡色地図`;
+  document.title = `${label} 日最深積雪 平面マップ ${startY}-${endY}`;
+
+  slider.min = startIndex;
+  slider.max = endIndex;
+  slider.value = startIndex;
+
+  render(startIndex);
   document.getElementById('loading').style.opacity = 0;
   setTimeout(() => { document.getElementById('loading').style.display = 'none'; }, 450);
 }
@@ -719,8 +688,7 @@ async function loadYear(yearKey) {
 yearSel.addEventListener('change', () => { loadYear(yearSel.value); });
 
 // ============================================================
-// 8) Load basemap, set up the default region, then the default
-//    year, then start.
+// 8) Load basemap + snow overlay, then start
 // ============================================================
 L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png', {
   maxZoom: 18,
@@ -729,8 +697,13 @@ L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png', {
 
 regionSel.value = DEFAULT_REGION;
 yearSel.value = DEFAULT_YEAR;
-await switchRegion(DEFAULT_REGION);
 await loadYear(DEFAULT_YEAR);
+
+snowLayer = L.imageOverlay(snowCanvas.toDataURL(), [[latMax, lonMin], [latMin, lonMax]], {
+  opacity: 1,
+  interactive: false
+}).addTo(map);
+updateCanvas(curIndex);
 }
 main();
 </script>
