@@ -239,6 +239,10 @@
     <span>積雪の塗り分け:</span>
     <div class="grad"></div>
     <span style="margin-left:14px;">数値＝地点の積雪深（0〜<span id="legendMax">cm</span>）</span>
+    <label style="margin-left:14px; display:inline-flex; align-items:center; gap:4px; cursor:pointer;">
+      <input type="checkbox" id="numbersToggle" checked>
+      数字を表示
+    </label>
     <span id="maxInfo"></span>
   </div>
 </div>
@@ -575,6 +579,8 @@ const rangeLabel = document.getElementById('rangeLabel');
 const yearSel = document.getElementById('yearSel');
 const regionSel = document.getElementById('regionSel');
 const titleText = document.getElementById('titleText');
+const numbersToggle = document.getElementById('numbersToggle');
+let numbersOn = true;
 
 function formatDate(s) {
   const [y, m, d] = s.split('/');
@@ -597,7 +603,7 @@ function render(idx) {
   for (let s = 0; s < N; s++) {
     const v = day[s];
     const lbl = labelObjs[s];
-    if (v === null || v <= 0) {
+    if (!numbersOn || v === null || v <= 0) {
       lbl.el.style.opacity = '0';
       lbl.valEl.style.pointerEvents = 'none';
     } else {
@@ -629,6 +635,10 @@ function stopPlay() {
 }
 playBtn.addEventListener('click', () => { playing ? stopPlay() : startPlay(); });
 speedSel.addEventListener('change', () => { if (playing) { stopPlay(); startPlay(); } });
+numbersToggle.addEventListener('change', () => {
+  numbersOn = numbersToggle.checked;
+  if (series.length) render(curIndex);
+});
 
 // ============================================================
 // 6) Region switching — camera only. The grid, mask, markers and
